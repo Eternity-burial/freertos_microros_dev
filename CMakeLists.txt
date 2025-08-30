@@ -58,7 +58,7 @@ add_compile_definitions(
         # [关键修正] 添加缺失的 CMSIS 设备头文件宏定义
 #        CMSIS_device_header=${DEVICE_HEADER_FILE}
         CMSIS_device_header="stm32f446xx.h"
-        USE_CUSTOM_SYSTICK_HANDLER_IMPLEMENTATION=1
+#        USE_CUSTOM_SYSTICK_HANDLER_IMPLEMENTATION=1
         ARM_MATH_CM4
         ARM_MATH_MATRIX_CHECK
         ARM_MATH_ROUNDING
@@ -100,8 +100,8 @@ file(GLOB_RECURSE CLEAN_SOURCES
 
 # 组 B: 依赖 POSIX 的源文件 (micro-ROS 相关的)
 file(GLOB_RECURSE POSIX_CLIENT_SOURCES
-        "Core/Src/custom_memory_manager.c"
         "Core/Src/allocators.c"
+        "Core/Src/custom_memory_manager.c"
         "Core/Src/microros_transports.c"
 )
 
@@ -119,8 +119,8 @@ list(REMOVE_ITEM CLEAN_SOURCES ${EXCLUDE_SRCS})
 list(REMOVE_ITEM CLEAN_SOURCES ${POSIX_CLIENT_SOURCES})
 
 # 移除标准的 FreeRTOS 堆实现，以避免与 micro-ROS 的 custom_memory_manager 冲突
-#file(GLOB STANDARD_HEAP_FILES "Middlewares/Third_Party/FreeRTOS/Source/portable/MemMang/heap_*.c")
-#list(REMOVE_ITEM CLEAN_SOURCES ${STANDARD_HEAP_FILES})
+file(GLOB STANDARD_HEAP_FILES "Middlewares/Third_Party/FreeRTOS/Source/portable/MemMang/heap_*.c")
+list(REMOVE_ITEM CLEAN_SOURCES ${STANDARD_HEAP_FILES})
 
 #*******************************************************************************************
 # 4. 创建构建目标
@@ -130,6 +130,11 @@ add_library(clean_lib OBJECT ${CLEAN_SOURCES})
 target_include_directories(clean_lib PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/micro-ROS/microros_static_library/include
 )
+
+# 将 freertos_posix 链接到 clean_lib。
+target_link_libraries(clean_lib PRIVATE freertos_posix)
+
+
 
 add_library(freertos_posix OBJECT ${FREERTOS_POSIX_SRCS})
 target_include_directories(freertos_posix PUBLIC
