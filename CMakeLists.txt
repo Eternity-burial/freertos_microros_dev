@@ -100,12 +100,13 @@ file(GLOB_RECURSE CLEAN_SOURCES
 
 # 组 B: 依赖 POSIX 的源文件 (micro-ROS 相关的)
 file(GLOB_RECURSE POSIX_CLIENT_SOURCES
-        "Core/Src/allocators.c"
-        "Core/Src/custom_memory_manager.c"
-        "Core/Src/microros_transports.c"
+        "Core/extra_sources/microros_transports/it_transport.c"
+        "Core/extra_sources/custom_memory_manager.c"
+        "Core/extra_sources/microros_allocators.c"
+        "Core/extra_sources/microros_time.c"
 )
 
-# 组 C: POSIX 实现自身的源文件
+# 组 C: POSIX 的源文件
 file(GLOB_RECURSE FREERTOS_POSIX_SRCS
         "lib/FreeRTOS-Plus-POSIX/source/*.c"
 )

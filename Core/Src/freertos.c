@@ -28,8 +28,6 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
-
-#include "allocators.h"
 #include "cmsis_os2.h"
 #include "usart.h" // 确保包含了 huart5 的头文件
 
@@ -41,10 +39,10 @@
 #include <rclc/executor.h>
 #include <rmw_microros/rmw_microros.h>
 
-#include "microros_transports.h" // 包含 freertos_serial_open 等函数声明
 
 // --- ROS Message includes ---
 #include <std_msgs/msg/header.h>
+#include <std_msgs/msg/int32.h>
 
 // --- [关键修正] 包含 POSIX 头文件 ---
 #include <time.h> // for clock_gettime
@@ -52,6 +50,7 @@
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
+typedef StaticTask_t osStaticThreadDef_t;
 /* USER CODE BEGIN PTD */
 
 /* USER CODE END PTD */
@@ -61,12 +60,6 @@
 #define LED_PORT    GPIOC
 #define LED_PIN     GPIO_PIN_0
 
-#define MICROROS_UART_HANDLE huart5
-
-#define STRING_BUFFER_LEN 50
-
-#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){ while(1){ HAL_GPIO_TogglePin(LED_PORT, LED_PIN); osDelay(20); } vTaskDelete(NULL);}}
-#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){ for(int i=0; i<5; i++){ HAL_GPIO_TogglePin(LED_PORT, LED_PIN); osDelay(50); HAL_GPIO_TogglePin(LED_PORT, LED_PIN); osDelay(50);}}}
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -76,53 +69,57 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-// --- [新添加] ping-pong 示例所需的全局变量 ---
-rcl_publisher_t ping_publisher;
-rcl_publisher_t pong_publisher;
-rcl_subscription_t ping_subscriber;
-rcl_subscription_t pong_subscriber;
+osSemaphoreId_t uartRxSemaphoreHandle;
+const osSemaphoreAttr_t uartRxSemaphore_attributes = {
+	.name = "uartRxSemaphore"
+  };
 
-std_msgs__msg__Header incoming_ping;
-std_msgs__msg__Header outcoming_ping;
-std_msgs__msg__Header incoming_pong;
-
-int device_id;
-int seq_no;
-int pong_count;
-// --- 全局变量结束 ---
-
-// micro-ROS App Task
-osThreadId_t microRosAppTaskHandle;
-const osThreadAttr_t microRosApp_attributes = {
-  .name = "microROS_app",
-  .stack_size = 3000 * 4, // micro-ROS 需要较大的栈空间
-  .priority = (osPriority_t) osPriorityNormal,
-};
-
-// LED Blinking Task
-osThreadId_t ledTaskHandle;
-const osThreadAttr_t ledTask_attributes = {
-  .name = "ledTask",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityLow, // 低优先级，不影响核心功能
-};
-
+// [新增] 用于存储从 UART 接收到的单个字符的缓冲区
+uint8_t rx_char_buffer[1];
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
+uint32_t defaultTaskBuffer[ 3000 ];
+osStaticThreadDef_t defaultTaskControlBlock;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 512 * 4,
+  .cb_mem = &defaultTaskControlBlock,
+  .cb_size = sizeof(defaultTaskControlBlock),
+  .stack_mem = &defaultTaskBuffer[0],
+  .stack_size = sizeof(defaultTaskBuffer),
   .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for LEDTask */
+osThreadId_t LEDTaskHandle;
+const osThreadAttr_t LEDTask_attributes = {
+  .name = "LEDTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* Definitions for UART_TEST */
+osThreadId_t UART_TESTHandle;
+const osThreadAttr_t UART_TEST_attributes = {
+  .name = "UART_TEST",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityLow,
 };
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
-void appMain(void *argument);
-void StartLedTask(void *argument);
+bool cubemx_transport_open(struct uxrCustomTransport * transport);
+bool cubemx_transport_close(struct uxrCustomTransport * transport);
+size_t cubemx_transport_write(struct uxrCustomTransport* transport, const uint8_t * buf, size_t len, uint8_t * err);
+size_t cubemx_transport_read(struct uxrCustomTransport* transport, uint8_t* buf, size_t len, int timeout, uint8_t* err);
+
+void * microros_allocate(size_t size, void * state);
+void microros_deallocate(void * pointer, void * state);
+void * microros_reallocate(void * pointer, size_t size, void * state);
+void * microros_zero_allocate(size_t number_of_elements, size_t size_of_element, void * state);
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
+void StartTask02(void *argument);
+void StartTask03(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -142,6 +139,8 @@ void MX_FREERTOS_Init(void) {
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
   /* add semaphores, ... */
+	/* [新增] 创建用于 UART 接收的二进制信号量 */
+	uartRxSemaphoreHandle = osSemaphoreNew(1, 0, &uartRxSemaphore_attributes);
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
@@ -156,10 +155,14 @@ void MX_FREERTOS_Init(void) {
   /* creation of defaultTask */
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
+  /* creation of LEDTask */
+  LEDTaskHandle = osThreadNew(StartTask02, NULL, &LEDTask_attributes);
+
+  /* creation of UART_TEST */
+  // UART_TESTHandle = osThreadNew(StartTask03, NULL, &UART_TEST_attributes);
+
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
-  // 创建 LED 闪烁任务
-  ledTaskHandle = osThreadNew(StartLedTask, NULL, &ledTask_attributes);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -178,174 +181,204 @@ void MX_FREERTOS_Init(void) {
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN StartDefaultTask */
+	/* Infinite loop */
+	// micro-ROS configuration
 
-  // --- micro-ROS 初始化 ---
+	rmw_uros_set_custom_transport(
+			true,
+			(void *) &huart5,
+			cubemx_transport_open,
+			cubemx_transport_close,
+			cubemx_transport_write,
+			cubemx_transport_read);
 
-  // 1. 设置 micro-ROS 的自定义传输层
-  //    这里我们使用 UART5，句柄由 main.c 中的宏 MICROROS_UART_HANDLE 定义
-  //    注意：extern 声明 huart5 句柄
-  extern UART_HandleTypeDef MICROROS_UART_HANDLE;
-  rmw_uros_set_custom_transport(
-    true,
-    (void *) &MICROROS_UART_HANDLE,
-    freertos_serial_open,
-    freertos_serial_close,
-    freertos_serial_write,
-    freertos_serial_read
-  );
+	rcl_allocator_t freeRTOS_allocator = rcutils_get_zero_initialized_allocator();
+	freeRTOS_allocator.allocate = microros_allocate;
+	freeRTOS_allocator.deallocate = microros_deallocate;
+	freeRTOS_allocator.reallocate = microros_reallocate;
+	freeRTOS_allocator.zero_allocate =  microros_zero_allocate;
 
-  // 2. 设置 micro-ROS 的内存分配器
-  rcl_allocator_t freeRTOS_allocator = rcutils_get_zero_initialized_allocator();
-  freeRTOS_allocator.allocate = __freertos_allocate;
-  freeRTOS_allocator.deallocate = __freertos_deallocate;
-  freeRTOS_allocator.reallocate = __freertos_reallocate;
-  freeRTOS_allocator.zero_allocate = __freertos_zero_allocate;
+	if (!rcutils_set_default_allocator(&freeRTOS_allocator)) {
+		while(1){
+			HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
+			osDelay(200);
+		}
+	}
 
-  if (!rcutils_set_default_allocator(&freeRTOS_allocator)) {
-    // 如果设置失败，可以在这里进行错误处理，比如快速闪烁LED
-    while(1) {
-      HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
-      osDelay(200);
-    }
-  }
+	// micro-ROS app
 
-  // 3. 创建 micro-ROS 主应用程序任务
-  microRosAppTaskHandle = osThreadNew(appMain, NULL, &microRosApp_attributes);
 
-  // 4. DefaultTask 初始化完成后可以挂起自身或进入低功耗循环
-  //    我们让它什么都不做，只延时
+	rcl_allocator_t allocator;
+	allocator = rcl_get_default_allocator();
+
+	//create init_options
+	rclc_support_t support;
+	// char* _argv[] = {NULL};
+
+	volatile rcl_ret_t ret;
+
+	// if (ret != RCL_RET_OK)
+	// {
+	// 	// 初始化失败，进入死循环并快速闪烁LED报错
+	do {
+		ret = rclc_support_init(&support, 0, NULL, &allocator);
+		if (ret != RCL_RET_OK) {
+			osDelay(1000); // 延时 1 秒再试
+		}
+	} while (ret != RCL_RET_OK);
+	// }
+	// create node
+	// rclc_node_init_default(&node, "cubemx_node", "", &support);
+	if (ret != RCL_RET_OK) {
+		ret = rclc_support_init(&support, 0, NULL, &allocator);
+	}
+
+	rcl_publisher_t publisher;
+	std_msgs__msg__Int32 msg;
+
+
+	rcl_node_t node;
+	ret = rclc_node_init_default(&node, "cubemx_node", "", &support);
+
+	// if (ret != RCL_RET_OK)
+	// {
+	// 	// 初始化失败，进入死循环并快速闪烁LED报错
+	// 	// 节点创建失败 (闪2次)
+	// 	while(1){
+	// 		HAL_GPIO_TogglePin(LED_PORT, LED_PIN); osDelay(100);
+	// 		HAL_GPIO_TogglePin(LED_PORT, LED_PIN); osDelay(100);
+	// 		HAL_GPIO_TogglePin(LED_PORT, LED_PIN); osDelay(100);
+	// 		HAL_GPIO_TogglePin(LED_PORT, LED_PIN); osDelay(700);
+	// 	}
+	// }
+	// create publisher
+	ret = rclc_publisher_init_default(
+	  &publisher,
+	  &node,
+	  ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
+	  "cube_node");
+	// if (ret != RCL_RET_OK)
+	// {
+	// 	// 发布者创建失败 (闪3次)
+	// 	while(1){
+	// 		HAL_GPIO_TogglePin(LED_PORT, LED_PIN); osDelay(100);
+	// 		HAL_GPIO_TogglePin(LED_PORT, LED_PIN); osDelay(100);
+	// 		HAL_GPIO_TogglePin(LED_PORT, LED_PIN); osDelay(100);
+	// 		HAL_GPIO_TogglePin(LED_PORT, LED_PIN); osDelay(100);
+	// 		HAL_GPIO_TogglePin(LED_PORT, LED_PIN); osDelay(100);
+	// 		HAL_GPIO_TogglePin(LED_PORT, LED_PIN); osDelay(500);
+	// 	}
+	// }
+	msg.data = 0;
+
+	for(;;)
+	{
+	    ret = rcl_publish(&publisher, &msg, NULL);
+		// if (ret != RCL_RET_OK)
+		// {
+		// 	// 发布失败。在循环中，我们通常不希望系统卡死。
+		// 	// 可以在这里做一个短暂的、不那么激进的报错提示，
+		// 	// 比如让LED快速闪一下，然后继续尝试。
+		// 	// 如果 Agent 断开连接，这里会持续报错。
+		// 	HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_SET);
+		// 	osDelay(10);
+		// 	HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_RESET);
+		// }
+		msg.data++;
+		osDelay(100);
+	}
+  /* USER CODE END StartDefaultTask */
+}
+
+/* USER CODE BEGIN Header_StartTask02 */
+/**
+* @brief Function implementing the LEDTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTask02 */
+void StartTask02(void *argument)
+{
+  /* USER CODE BEGIN StartTask02 */
+  /* Infinite loop */
   for(;;)
   {
-    osDelay(1000);
-  }
+  	// 翻转 LED 状态
+  	HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
 
-  /* USER CODE END StartDefaultTask */
+  	// 延时 500ms，实现 1Hz 闪烁
+  	osDelay(500);
+  }
+  /* USER CODE END StartTask02 */
+}
+
+/* USER CODE BEGIN Header_StartTask03 */
+/**
+* @brief Function implementing the UART_TEST thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTask03 */
+void StartTask03(void *argument)
+{
+	/* [修改] 整个任务逻辑更新为回显功能 */
+	/* USER CODE BEGIN StartTask03 */
+	char tx_buffer[100];
+	uint32_t heartbeat_counter = 0;
+
+	// 1. 首次启动 UART 中断接收，准备接收 1 个字节到全局的 rx_char_buffer 中
+	//    这是一个非阻塞函数，它会立即返回
+	HAL_UART_Receive_IT(&huart5, rx_char_buffer, 1);
+
+	/* Infinite loop */
+	for(;;)
+	{
+		// 2. 尝试获取信号量，设置 2000ms (2秒) 的超时
+		//    任务将在此处阻塞，直到中断发生或超时
+		osStatus_t status = osSemaphoreAcquire(uartRxSemaphoreHandle, 2000);
+
+		if (status == osOK)
+		{
+			// --- 情况 A: 成功获取信号量 ---
+			// 这意味着 HAL_UART_RxCpltCallback 中断被触发，我们收到了一个字符
+
+			// a. 构建回显消息
+			sprintf(tx_buffer, "Echo: %c\r\n", rx_char_buffer[0]);
+
+			// b. 将回显消息通过 UART5 发送回去
+			HAL_UART_Transmit(&huart5, (uint8_t*)tx_buffer, strlen(tx_buffer), 100);
+
+			// c. [关键步骤] 再次开启中断接收，为接收下一个字符做准备
+			HAL_UART_Receive_IT(&huart5, rx_char_buffer, 1);
+		}
+		else if (status == osErrorTimeout)
+		{
+			// --- 情况 B: 等待超时 ---
+			// 这意味着在过去的 2 秒内，我们没有收到任何来自 Linux 的数据
+
+			// 发送一条心跳消息，证明 MCU 仍在正常运行
+			sprintf(tx_buffer, "Heartbeat... count: %lu\r\n", heartbeat_counter++);
+			HAL_UART_Transmit(&huart5, (uint8_t*)tx_buffer, strlen(tx_buffer), 100);
+		}
+	}
+	/* USER CODE END StartTask03 */
 }
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
-
-// --- [新添加] ping-pong 示例的回调函数 ---
-void ping_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
-{
-	(void) last_call_time;
-
-	if (timer != NULL) {
-		seq_no = rand();
-		sprintf(outcoming_ping.frame_id.data, "%d_%d", seq_no, device_id);
-		outcoming_ping.frame_id.size = strlen(outcoming_ping.frame_id.data);
-
-		struct timespec ts;
-		clock_gettime(CLOCK_REALTIME, &ts);
-		outcoming_ping.stamp.sec = ts.tv_sec;
-		outcoming_ping.stamp.nanosec = ts.tv_nsec;
-
-		pong_count = 0;
-		RCSOFTCHECK(rcl_publish(&ping_publisher, (const void*)&outcoming_ping, NULL));
-	}
-}
-
-void ping_subscription_callback(const void * msgin)
-{
-	const std_msgs__msg__Header * msg = (const std_msgs__msg__Header *)msgin;
-
-	if(strcmp(outcoming_ping.frame_id.data, msg->frame_id.data) != 0){
-		RCSOFTCHECK(rcl_publish(&pong_publisher, (const void*)msg, NULL));
-	}
-}
-
-void pong_subscription_callback(const void * msgin)
-{
-	const std_msgs__msg__Header * msg = (const std_msgs__msg__Header *)msgin;
-
-	if(strcmp(outcoming_ping.frame_id.data, msg->frame_id.data) == 0) {
-		pong_count++;
-	}
-}
-// --- 回调函数结束 ---
-
-
 /**
-  * @brief The main micro-ROS application task.
-  *        [修改] 将此函数的内容替换为完整的 ping-pong 示例。
+  * @brief Rx Transfer completed callback.
+  * @param huart UART handle.
+  * @retval None
   */
-void appMain(void *argument)
-{
-	rcl_allocator_t allocator = rcl_get_default_allocator();
-	rclc_support_t support;
-
-	RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
-
-	rcl_node_t node;
-	RCCHECK(rclc_node_init_default(&node, "stm32_pingpong_node", "", &support));
-
-	RCCHECK(rclc_publisher_init_default(&ping_publisher, &node,
-		ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Header), "/microROS/ping"));
-
-	RCCHECK(rclc_publisher_init_best_effort(&pong_publisher, &node,
-		ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Header), "/microROS/pong"));
-
-	RCCHECK(rclc_subscription_init_best_effort(&ping_subscriber, &node,
-		ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Header), "/microROS/ping"));
-
-	RCCHECK(rclc_subscription_init_best_effort(&pong_subscriber, &node,
-		ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Header), "/microROS/pong"));
-
-	rcl_timer_t timer;
-	RCCHECK(rclc_timer_init_default(&timer, &support, RCL_MS_TO_NS(2000), ping_timer_callback));
-
-	rclc_executor_t executor;
-	RCCHECK(rclc_executor_init(&executor, &support.context, 3, &allocator));
-	RCCHECK(rclc_executor_add_timer(&executor, &timer));
-	RCCHECK(rclc_executor_add_subscription(&executor, &ping_subscriber, &incoming_ping,
-		&ping_subscription_callback, ON_NEW_DATA));
-	RCCHECK(rclc_executor_add_subscription(&executor, &pong_subscriber, &incoming_pong,
-		&pong_subscription_callback, ON_NEW_DATA));
-
-	char outcoming_ping_buffer[STRING_BUFFER_LEN];
-	outcoming_ping.frame_id.data = outcoming_ping_buffer;
-	outcoming_ping.frame_id.capacity = STRING_BUFFER_LEN;
-
-	char incoming_ping_buffer[STRING_BUFFER_LEN];
-	incoming_ping.frame_id.data = incoming_ping_buffer;
-	incoming_ping.frame_id.capacity = STRING_BUFFER_LEN;
-
-	char incoming_pong_buffer[STRING_BUFFER_LEN];
-	incoming_pong.frame_id.data = incoming_pong_buffer;
-	incoming_pong.frame_id.capacity = STRING_BUFFER_LEN;
-
-	srand(HAL_GetTick());
-	device_id = rand();
-
-	while(1){
-		rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
-		usleep(10000); // 延时 10ms
-	}
-
-	RCCHECK(rcl_publisher_fini(&ping_publisher, &node));
-	RCCHECK(rcl_publisher_fini(&pong_publisher, &node));
-	RCCHECK(rcl_subscription_fini(&ping_subscriber, &node));
-	RCCHECK(rcl_subscription_fini(&pong_subscriber, &node));
-	RCCHECK(rcl_node_fini(&node));
-}
-
-/**
-  * @brief Function implementing the ledTask thread.
-  * @param argument: Not used
-  */
-void StartLedTask(void *argument)
-{
-  /* Infinite loop */
-  for(;;)
-  {
-    // 翻转 LED 状态
-    HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
-
-    // 延时 500ms，实现 1Hz 闪烁
-    osDelay(500);
-  }
-}
-
-
+// void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+// {
+// 	// 检查是否是 UART5 触发的中断
+// 	if (huart->Instance == UART5)
+// 	{
+// 		// 释放信号量，以唤醒正在等待的 StartTask03
+// 		osSemaphoreRelease(uartRxSemaphoreHandle);
+// 	}
+// }
 /* USER CODE END Application */
 
